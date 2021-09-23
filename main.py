@@ -24,6 +24,17 @@ def show_tensor_images(image_tensor, num_images=25, size=(1, 28, 28)):
     plt.imshow(image_grid.permute(1, 2, 0).squeeze())
     plt.show()
 
+def make_grad_hook():
+    '''
+    Function to keep track of gradients for visualization purposes, 
+    which fills the grads list when using model.apply(grad_hook).
+    '''
+    grads = []
+    def grad_hook(m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            grads.append(m.weight.grad)
+    return grads, grad_hook
+
 # GENERATOR
 
 class Generator(nn.Module):
@@ -111,70 +122,28 @@ def get_noise(n_samples, z_dim, device='cpu'):
     '''
     return torch.randn(n_samples, z_dim, device=device)
 
-def test_make_gen_block():
-    gen = Generator()
-    num_test = 100
+# CRITIC
 
-    # Test the hidden block
-    test_hidden_noise = get_noise(num_test, gen.z_dim)
-    test_hidden_block = gen.make_gen_block(10, 20, kernel_size=4, stride=1)
-    test_uns_noise = gen.unsqueeze_noise(test_hidden_noise)
-    hidden_output = test_hidden_block(test_uns_noise)
-
-    # Check that it works with other strides
-    test_hidden_block_stride = gen.make_gen_block(20, 20, kernel_size=4, stride=2)
-
-    test_final_noise = get_noise(num_test, gen.z_dim) * 20
-    test_final_block = gen.make_gen_block(10, 20, final_layer=True)
-    test_final_uns_noise = gen.unsqueeze_noise(test_final_noise)
-    final_output = test_final_block(test_final_uns_noise)
-
-    # Test the whole thing:
-    test_gen_noise = get_noise(num_test, gen.z_dim)
-    test_uns_gen_noise = gen.unsqueeze_noise(test_gen_noise)
-    gen_output = gen(test_uns_gen_noise)
-
-    assert tuple(hidden_output.shape) == (num_test, 20, 4, 4)
-    assert hidden_output.max() > 1
-    assert hidden_output.min() == 0
-    assert hidden_output.std() > 0.2
-    assert hidden_output.std() < 1
-    assert hidden_output.std() > 0.5
-
-    assert tuple(test_hidden_block_stride(hidden_output).shape) == (num_test, 20, 10, 10)
-
-    assert final_output.max().item() == 1
-    assert final_output.min().item() == -1
-
-    assert tuple(gen_output.shape) == (num_test, 1, 28, 28)
-    assert gen_output.std() > 0.5
-    assert gen_output.std() < 0.8
-    print("Success!")
-
-test_make_gen_block()
-
-# DISCRIMINATOR
-
-class Discriminator(nn.Module):
+class Critic(nn.Module):
     '''
-    Discriminator Class
+    Critic Class
     Values:
         im_chan: the number of channels in the images, fitted for the dataset used, a scalar
               (MNIST is black-and-white, so 1 channel is your default)
-    hidden_dim: the inner dimension, a scalar
+        hidden_dim: the inner dimension, a scalar
     '''
-    def __init__(self, im_chan=1, hidden_dim=16):
-        super(Discriminator, self).__init__()
-        self.disc = nn.Sequential(
-            self.make_disc_block(im_chan, hidden_dim),
-            self.make_disc_block(hidden_dim, hidden_dim * 2),
-            self.make_disc_block(hidden_dim * 2, 1, final_layer=True),
+    def __init__(self, im_chan=1, hidden_dim=64):
+        super(Critic, self).__init__()
+        self.crit = nn.Sequential(
+            self.make_crit_block(im_chan, hidden_dim),
+            self.make_crit_block(hidden_dim, hidden_dim * 2),
+            self.make_crit_block(hidden_dim * 2, 1, final_layer=True),
         )
 
-    def make_disc_block(self, input_channels, output_channels, kernel_size=4, stride=2, final_layer=False):
+    def make_crit_block(self, input_channels, output_channels, kernel_size=4, stride=2, final_layer=False):
         '''
-        Function to return a sequence of operations corresponding to a discriminator block of DCGAN, 
-        corresponding to a convolution, a batchnorm (except for in the last layer), and an activation.
+        Function to return a sequence of operations corresponding to a critic block of WGAN-GP;
+        a convolution, a batchnorm (except in the final layer), and an activation (except in the final layer).
         Parameters:
             input_channels: how many channels the input feature representation has
             output_channels: how many channels the output feature representation should have
@@ -182,12 +151,7 @@ class Discriminator(nn.Module):
             stride: the stride of the convolution
             final_layer: a boolean, true if it is the final layer and false otherwise 
                       (affects activation and batchnorm)
-        '''
-        #     Steps:
-        #       1) Add a convolutional layer using the given parameters.
-        #       2) Do a batchnorm, except for the last layer.
-        #       3) Follow each batchnorm with a LeakyReLU activation with slope 0.2.
-        
+        '''        
         # Build the neural block
         if not final_layer:
             return nn.Sequential(
@@ -202,59 +166,65 @@ class Discriminator(nn.Module):
 
     def forward(self, image):
         '''
-        Function for completing a forward pass of the discriminator: Given an image tensor, 
+        Function for completing a forward pass of the critic: Given an image tensor, 
         returns a 1-dimension tensor representing fake/real.
         Parameters:
             image: a flattened image tensor with dimension (im_dim)
         '''
-        disc_pred = self.disc(image)
-        return disc_pred.view(len(disc_pred), -1)
+        crit_pred = self.crit(image)
+        return crit_pred.view(len(crit_pred), -1)
 
-def test_make_disc_block():
+# GRADIENT PENALTY
+
+def get_gradient(crit, real, fake, epsilon):
     '''
-    Test your make_disc_block() function
+    Return the gradient of the critic's scores with respect to mixes of real and fake images.
+    Parameters:
+        crit: the critic model
+        real: a batch of real images
+        fake: a batch of fake images
+        epsilon: a vector of the uniformly random proportions of real/fake per mixed image
+    Returns:
+        gradient: the gradient of the critic's scores, with respect to the mixed image
     '''
-    num_test = 100
+    # Mix the images together
+    mixed_images = real * epsilon + fake * (1 - epsilon)
 
-    gen = Generator()
-    disc = Discriminator()
-    test_images = gen(get_noise(num_test, gen.z_dim))
+    # Calculate the critic's scores on the mixed images
+    mixed_scores = crit(mixed_images)
+    
+    # Take the gradient of the scores with respect to the images
+    gradient = torch.autograd.grad(
+        # Note: You need to take the gradient of outputs with respect to inputs.
+        # This documentation may be useful, but it should not be necessary:
+        # https://pytorch.org/docs/stable/autograd.html#torch.autograd.grad
+        inputs=mixed_images,
+        outputs=mixed_scores,
+        # These other parameters have to do with the pytorch autograd engine works
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    return gradient
 
-    # Test the hidden block
-    test_hidden_block = disc.make_disc_block(1, 5, kernel_size=6, stride=3)
-    hidden_output = test_hidden_block(test_images)
+def test_get_gradient(image_shape, device='cpu'):
+    crit = Critic().to(device) 
+    real = torch.randn(*image_shape, device=device) + 1
+    fake = torch.randn(*image_shape, device=device) - 1
+    epsilon_shape = [1 for _ in image_shape]
+    epsilon_shape[0] = image_shape[0]
+    epsilon = torch.rand(epsilon_shape, device=device).requires_grad_()
+    gradient = get_gradient(crit, real, fake, epsilon)
+    assert tuple(gradient.shape) == image_shape
+    assert gradient.max() > 0
+    assert gradient.min() < 0
+    return gradient
 
-    # Test the final block
-    test_final_block = disc.make_disc_block(1, 10, kernel_size=2, stride=5, final_layer=True)
-    final_output = test_final_block(test_images)
+gradient = test_get_gradient((256, 1, 28, 28))
+print("Success!")
 
-    # Test the whole thing:
-    disc_output = disc(test_images)
 
-    # Test the hidden block
-    assert tuple(hidden_output.shape) == (num_test, 5, 8, 8)
-    # Because of the LeakyReLU slope
-    assert -hidden_output.min() / hidden_output.max() > 0.15
-    assert -hidden_output.min() / hidden_output.max() < 0.25
-    assert hidden_output.std() > 0.5
-    assert hidden_output.std() < 1
 
-    # Test the final block
-
-    assert tuple(final_output.shape) == (num_test, 10, 6, 6)
-    assert final_output.max() > 1.0
-    assert final_output.min() < -1.0
-    assert final_output.std() > 0.3
-    assert final_output.std() < 0.6
-
-    # Test the whole thing:
-
-    assert tuple(disc_output.shape) == (num_test, 1)
-    assert disc_output.std() > 0.25
-    assert disc_output.std() < 0.5
-    print("Success!")
-
-test_make_disc_block()
 
 # TRAINING
 
@@ -271,12 +241,14 @@ def train():
     criterion = nn.BCEWithLogitsLoss()
     n_epochs = 200
     z_dim = 64
-    display_step = 512
+    display_step = 1000
     batch_size = 128
     lr = 0.0002 # works well on DCGAN
     beta_1 = 0.5 # https://distill.pub/2017/momentum/
     beta_2 = 0.999
     device = 'cpu'
+    c_lambda = 10
+    crit_repeats = 5
 
     # You can tranform the image values to be between -1 and 1 (the range of the tanh activation)
     transform = transforms.Compose([
@@ -285,14 +257,14 @@ def train():
     ])
 
     dataloader = DataLoader(
-        MNIST('.', download=False, transform=transform), # download=True for the first time running
+        MNIST('.', download=True, transform=transform), # download=True for the first time running
         batch_size=batch_size,
         shuffle=True)
 
     gen = Generator(z_dim).to(device)
     gen_opt = torch.optim.Adam(gen.parameters(), lr=lr, betas=(beta_1, beta_2))
-    disc = Discriminator().to(device) 
-    disc_opt = torch.optim.Adam(disc.parameters(), lr=lr, betas=(beta_1, beta_2))
+    crit = Critic().to(device) 
+    crit_opt = torch.optim.Adam(crit.parameters(), lr=lr, betas=(beta_1, beta_2))
 
     # You initialize the weights to the normal distribution
     # with mean 0 and standard deviation 0.02
@@ -302,11 +274,10 @@ def train():
         if isinstance(m, nn.BatchNorm2d):
             torch.nn.init.normal_(m.weight, 0.0, 0.02)
             torch.nn.init.constant_(m.bias, 0)
-    gen = gen.apply(weights_init)
-    disc = disc.apply(weights_init)
 
-    n_epochs = 50
-    cur_step = 0
+    gen = gen.apply(weights_init)
+    crit = crit.apply(weights_init)
+
     mean_generator_loss = 0
     mean_discriminator_loss = 0
     for epoch in range(n_epochs):
@@ -353,5 +324,5 @@ def train():
                 mean_discriminator_loss = 0
             cur_step += 1
 
-if __name__ == '__main__':
-    train()
+# if __name__ == '__main__':
+#     train()
